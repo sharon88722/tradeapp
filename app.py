@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import os
+import requests
 
 # ==========================================
 # 1. PWA 配置與頁面設定
@@ -16,10 +17,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 注入 HTML 讓網頁在手機上更像 App (隱藏網址列、全螢幕)
+# 注入 HTML 讓網頁在手機上更像 App
 pwa_meta_tags = """
 <style>
-    /* 隱藏 Streamlit 預設的漢堡選單與 footer (選擇性) */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 </style>
@@ -30,24 +30,29 @@ pwa_meta_tags = """
 st.markdown(pwa_meta_tags, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 解決中文字型問題 (快取機制)
+# 2. 解決中文字型問題 (修正版 - 更穩定)
 # ==========================================
 @st.cache_resource
 def get_chinese_font():
-    # 下載字型到暫存區，避免每次重跑都下載
     font_path = "NotoSansTC-Regular.ttf"
-    if not os.path.exists(font_path):
-        import requests
-        url = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC-Regular.ttf"
-        r = requests.get(url, allow_redirects=True)
-        with open(font_path, 'wb') as f:
-            f.write(r.content)
     
-    font_prop = fm.FontProperties(fname=font_path)
-    return font_prop
+    # 如果字型檔案不存在，則下載
+    if not os.path.exists(font_path):
+        url = "https://github.com/google/fonts/raw/main/ofl/notosanstc/NotoSansTC-Regular.ttf"
+        try:
+            r = requests.get(url, allow_redirects=True)
+            r.raise_for_status() # 檢查是否下載成功
+            with open(font_path, 'wb') as f:
+                f.write(r.content)
+        except Exception as e:
+            st.error(f"字型下載失敗: {e}")
+            return None
+    
+    # 回傳 FontProperties 物件，不設定全域 rcParams 以避免 Linux 環境報錯
+    return fm.FontProperties(fname=font_path)
 
+# 取得字型物件
 font_prop = get_chinese_font()
-plt.rcParams['font.family'] = font_prop.get_name()
 
 # ==========================================
 # 3. 側邊欄設定 (使用者輸入)
@@ -62,20 +67,27 @@ grid_count = st.sidebar.slider("網格數量 (條)", min_value=3, max_value=20, 
 # ==========================================
 # 4. 核心邏輯函數
 # ==========================================
-@st.cache_data(ttl=3600) # 設定快取 1 小時，避免頻繁請求
+@st.cache_data(ttl=3600)
 def load_data(symbol, time_period):
     try:
         df = yf.download(symbol, period=time_period, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df[['Close']].copy().dropna()
+        if df.empty:
+            return None
         return df
-    except Exception as e:
+    except Exception:
         return None
 
 def calculate_signals(df, grid_num):
     high_price = df['Close'].max()
     low_price = df['Close'].min()
+    
+    # 避免最高價等於最低價導致除以零
+    if high_price == low_price:
+        return [], [], []
+
     grids = np.linspace(low_price, high_price, grid_num + 2)[1:-1]
     
     buy_signals = []
@@ -89,10 +101,8 @@ def calculate_signals(df, grid_num):
         date = dates[i]
         
         for g in grids:
-            # 跌破買入
             if prev > g and curr <= g:
                 buy_signals.append((date, curr))
-            # 突破賣出
             if prev < g and curr >= g:
                 sell_signals.append((date, curr))
                 
@@ -103,37 +113,37 @@ def calculate_signals(df, grid_num):
 # ==========================================
 st.title(f"📈 {stock_id} 網格交易回測")
 
-# 下載資料
 with st.spinner('正在抓取股價資料...'):
     df = load_data(stock_id, period)
 
-if df is None or df.empty:
+if df is None:
     st.error(f"找不到 {stock_id} 的資料，請確認代碼是否正確。")
 else:
-    # 執行計算
     grids, buys, sells = calculate_signals(df, grid_count)
     
-    # 顯示關鍵數據 KPIs
+    # 顯示關鍵數據
     col1, col2, col3 = st.columns(3)
     col1.metric("區間最高價", f"{df['Close'].max():.2f}")
     col1.metric("區間最低價", f"{df['Close'].min():.2f}")
     col2.metric("總買入次數", f"{len(buys)} 次")
     col2.metric("總賣出次數", f"{len(sells)} 次")
-    col3.metric("網格間距", f"{(grids[1]-grids[0]):.2f} 元")
+    
+    if len(grids) > 1:
+        grid_spread = grids[1] - grids[0]
+        col3.metric("網格間距", f"{grid_spread:.2f} 元")
+    else:
+        col3.metric("網格間距", "N/A")
 
     # ==========================================
     # 6. 繪圖 (Matplotlib)
     # ==========================================
     fig, ax = plt.subplots(figsize=(16, 9))
     
-    # 畫股價
     ax.plot(df.index, df['Close'], label='收盤價', color='royalblue', linewidth=2, alpha=0.8)
     
-    # 畫網格
     for g in grids:
         ax.axhline(y=g, color='gray', linestyle='--', linewidth=0.8, alpha=0.6)
         
-    # 畫訊號
     if buys:
         b_dates, b_prices = zip(*buys)
         ax.scatter(b_dates, b_prices, marker='^', color='green', s=150, label='買入訊號', zorder=5)
@@ -142,17 +152,17 @@ else:
         s_dates, s_prices = zip(*sells)
         ax.scatter(s_dates, s_prices, marker='v', color='red', s=150, label='賣出訊號', zorder=5)
     
-    # 設定標籤與字型
+    # 這裡直接使用 fontproperties 參數，這是最安全的做法
     ax.set_title(f'{stock_id} 網格交易回測', fontproperties=font_prop, fontsize=24)
     ax.set_xlabel('日期', fontproperties=font_prop, fontsize=16)
     ax.set_ylabel('股價 (TWD)', fontproperties=font_prop, fontsize=16)
+    
+    # 圖例字型處理
     ax.legend(prop=font_prop, loc='best', fontsize=14)
     ax.grid(True, alpha=0.3)
     
-    # 顯示圖表
     st.pyplot(fig)
     
-    # 顯示詳細交易紀錄
     with st.expander("查看詳細交易訊號列表"):
         signal_data = []
         for d, p in buys:
